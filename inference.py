@@ -1,26 +1,22 @@
 """
 Baseline Inference Script
 ========================
-MUST use judges' injected API_KEY and API_BASE_URL for LLM calls.
-Falls back to heuristic only if LLM call fails.
+MANDATORY - Uses judges' injected API_BASE_URL, API_KEY, and MODEL_NAME.
 """
 
-from __future__ import annotations
-
+import os
 import asyncio
 import json
-import os
 import textwrap
-from typing import Any, Dict, List, Optional
+from typing import List, Optional, Dict, Any
 
 from openai import OpenAI
 
 from client import ChemicalDiscoveryEnv
 from models import ChemicalDiscoveryAction
 
-IMAGE_NAME = os.getenv("IMAGE_NAME")
-API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN") or ""
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN") or ""
 MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-7B-Instruct"
 
 BENCHMARK = os.getenv("BENCHMARK", "chem-discovery-env")
@@ -31,7 +27,7 @@ TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "200"))
 SUCCESS_SCORE_THRESHOLD = float(os.getenv("SUCCESS_SCORE_THRESHOLD", "0.1"))
 
-MAX_TOTAL_REWARD = float(MAX_STEPS)  # reward per step is in [0,1]
+MAX_TOTAL_REWARD = float(MAX_STEPS)
 
 
 def log_start(task: str, env: str, model: str) -> None:
@@ -62,7 +58,6 @@ def _compact_json(obj: Any) -> str:
 
 
 def _heuristic_prediction(task: str, obs: Dict[str, Any]) -> Dict[str, Any]:
-    # Rule-of-5 heuristics using already-provided properties.
     if task == "easy":
         is_drug_like = (
             obs["molecular_weight"] < 500
@@ -82,144 +77,89 @@ def _heuristic_prediction(task: str, obs: Dict[str, Any]) -> Dict[str, Any]:
         if obs["hba"] > 10:
             violations += 1
         return {"violations": int(violations)}
-    # hard: neutral baseline
     return {"activity": 0.5, "safety": 0.5, "synthesizability": 0.5}
 
 
 def _system_prompt(task: str) -> str:
     if task == "easy":
-        return textwrap.dedent(
-            """
-            You are predicting drug-likeness using Lipinski-style heuristics.
-            Output ONLY a JSON object with key: is_drug_like (boolean).
-            """
-        ).strip()
+        return 'You are predicting drug-likeness. Output ONLY JSON: {"is_drug_like": true|false}'
     if task == "medium":
-        return textwrap.dedent(
-            """
-            You are predicting Lipinski rule-of-5 violation count.
-            Output ONLY a JSON object with key: violations (integer).
-            """
-        ).strip()
-    return textwrap.dedent(
-        """
-        You are predicting multi-objective scores.
-        Output ONLY a JSON object with keys:
-          activity (float 0..1), safety (float 0..1), synthesizability (float 0..1)
-        """
-    ).strip()
+        return (
+            'You are predicting violation count. Output ONLY JSON: {"violations": 0-4}'
+        )
+    return 'Predict multi-objective scores. Output ONLY JSON: {"activity":0-1,"safety":0-1,"synthesizability":0-1}'
 
 
 def _user_prompt(task: str, obs: Dict[str, Any]) -> str:
-    # Keep prompt compact and stable.
-    payload = {
-        "task": task,
-        "molecule_id": obs.get("molecule_id"),
-        "smiles": obs.get("smiles"),
-        "properties": {
-            "molecular_weight": obs.get("molecular_weight"),
-            "logp": obs.get("logp"),
-            "tpsa": obs.get("tpsa"),
-            "hbd": obs.get("hbd"),
-            "hba": obs.get("hba"),
-            "rotatable_bonds": obs.get("rotatable_bonds"),
-        },
-    }
-    return "Predict now. Return only JSON.\n" + _compact_json(payload)
+    return f"Task: {task}\nMolecule: {obs.get('molecule_id')}\nProperties: MW={obs.get('molecular_weight')}, LogP={obs.get('logp')}, HBD={obs.get('hbd')}, HBA={obs.get('hba')}\nPredict now. Return ONLY JSON."
 
 
-def _llm_prediction(client: OpenAI, task: str, obs: Dict[str, Any]) -> Dict[str, Any]:
-    completion = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": _system_prompt(task)},
-            {"role": "user", "content": _user_prompt(task, obs)},
-        ],
-        temperature=TEMPERATURE,
-        max_tokens=MAX_TOKENS,
-        stream=False,
-    )
-    text = (completion.choices[0].message.content or "").strip()
-    # Robust parse: allow model to return surrounding text.
-    try:
-        return json.loads(text)
-    except Exception:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return json.loads(text[start : end + 1])
-        raise
-
-
-async def run_task(task: str) -> None:
-    client = None
-    if API_KEY:
-        try:
-            client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-        except Exception as e:
-            print(f"[WARN] Failed to create LLM client: {e}", flush=True)
-    else:
-        print("[DEBUG] No API_KEY found, will use heuristic", flush=True)
-
-    # Prefer docker image if provided; else connect to a running server.
-    env = None
-    try:
-        env = (
-            ChemicalDiscoveryEnv.from_docker_image(IMAGE_NAME)
-            if IMAGE_NAME
-            else ChemicalDiscoveryEnv(base_url=ENV_BASE_URL)
-        )
-    except Exception as e:
-        log_start(task=task, env=BENCHMARK, model=MODEL_NAME)
-        print(f"[ERROR] Failed to connect to environment: {e}", flush=True)
-        log_end(success=False, steps=0, score=0.0, rewards=[])
-        return
+async def _run_task_async(task: str, client: Optional[OpenAI]) -> None:
+    env = ChemicalDiscoveryEnv(base_url=ENV_BASE_URL)
 
     rewards: List[float] = []
     steps_taken = 0
-    score = 0.0
     success = False
-    last_action_error: Optional[str] = None
+    last_error: Optional[str] = None
 
     log_start(task=task, env=BENCHMARK, model=MODEL_NAME)
 
     try:
         result = await env.reset(task=task)
-        obs = (
-            result.observation.model_dump()
-            if hasattr(result.observation, "model_dump")
-            else dict(result.observation)
-        )
+        obs = result.observation
+        if hasattr(obs, "model_dump"):
+            obs = obs.model_dump()
 
         for step in range(1, MAX_STEPS + 1):
             if result.done:
                 break
 
             try:
-                if client is not None:
-                    print(f"[DEBUG] Calling LLM for {task}", flush=True)
-                    pred = _llm_prediction(client, task, obs)
-                    last_action_error = None
+                if client:
+                    print(f"[DEBUG] Making LLM call for {task} step {step}", flush=True)
+                    completion = client.chat.completions.create(
+                        model=MODEL_NAME,
+                        messages=[
+                            {"role": "system", "content": _system_prompt(task)},
+                            {"role": "user", "content": _user_prompt(task, obs)},
+                        ],
+                        temperature=TEMPERATURE,
+                        max_tokens=MAX_TOKENS,
+                        stream=False,
+                    )
+                    text = (completion.choices[0].message.content or "").strip()
+                    try:
+                        pred = json.loads(text)
+                    except Exception:
+                        start = text.find("{")
+                        end = text.rfind("}")
+                        if start != -1 and end != -1 and end > start:
+                            pred = json.loads(text[start : end + 1])
+                        else:
+                            pred = _heuristic_prediction(task, obs)
+                    last_error = None
                 else:
                     pred = _heuristic_prediction(task, obs)
-                    last_action_error = "null"
+                    last_error = "no_api_key"
             except Exception as exc:
                 pred = _heuristic_prediction(task, obs)
-                last_action_error = str(exc)
+                last_error = str(exc)
 
             action_obj = ChemicalDiscoveryAction(
                 molecule_id=obs.get("molecule_id", ""),
                 prediction=pred,
-                confidence=0.7 if client is not None else 0.9,
+                confidence=0.7,
             )
-            action_str = _compact_json(action_obj.model_dump(exclude_none=True))
+            if hasattr(action_obj, "model_dump"):
+                action_dict = action_obj.model_dump(exclude_none=True)
+            else:
+                action_dict = action_obj
+            action_str = _compact_json(action_dict)
 
             result = await env.step(action_obj)
-            obs = (
-                result.observation.model_dump()
-                if hasattr(result.observation, "model_dump")
-                else dict(result.observation)
-            )
+            obs = result.observation
+            if hasattr(obs, "model_dump"):
+                obs = obs.model_dump()
 
             reward = float(result.reward or 0.0)
             done = bool(result.done)
@@ -227,11 +167,7 @@ async def run_task(task: str) -> None:
             rewards.append(reward)
             steps_taken = step
             log_step(
-                step=step,
-                action=action_str,
-                reward=reward,
-                done=done,
-                error=last_action_error,
+                step=step, action=action_str, reward=reward, done=done, error=last_error
             )
 
             if done:
@@ -241,21 +177,29 @@ async def run_task(task: str) -> None:
         score = min(max(score, 0.0), 1.0)
         success = score >= SUCCESS_SCORE_THRESHOLD
 
-    except Exception as e:
-        print(f"[ERROR] Task {task} failed: {e}", flush=True)
     finally:
-        if env:
-            try:
-                await env.close()
-            except Exception:
-                pass
+        try:
+            await env.close()
+        except Exception:
+            pass
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
-async def main() -> None:
+async def _main_async() -> None:
+    client = None
+    if API_KEY:
+        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+
     for task in ("easy", "medium", "hard"):
-        await run_task(task)
+        await _run_task_async(task, client)
+
+
+def main() -> None:
+    print(f"[DEBUG] API_KEY set: {bool(API_KEY)}", flush=True)
+    print(f"[DEBUG] API_BASE_URL: {API_BASE_URL}", flush=True)
+    print(f"[DEBUG] MODEL_NAME: {MODEL_NAME}", flush=True)
+    asyncio.run(_main_async())
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
