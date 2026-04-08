@@ -159,14 +159,26 @@ def _llm_prediction(client: OpenAI, task: str, obs: Dict[str, Any]) -> Dict[str,
 
 
 async def run_task(task: str) -> None:
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY) if API_KEY else None
+    client = None
+    if API_KEY:
+        try:
+            client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+        except Exception:
+            pass
 
     # Prefer docker image if provided; else connect to a running server.
-    env = (
-        ChemicalDiscoveryEnv.from_docker_image(IMAGE_NAME)
-        if IMAGE_NAME
-        else ChemicalDiscoveryEnv(base_url=ENV_BASE_URL)
-    )
+    env = None
+    try:
+        env = (
+            ChemicalDiscoveryEnv.from_docker_image(IMAGE_NAME)
+            if IMAGE_NAME
+            else ChemicalDiscoveryEnv(base_url=ENV_BASE_URL)
+        )
+    except Exception as e:
+        log_start(task=task, env=BENCHMARK, model=MODEL_NAME)
+        print(f"[ERROR] Failed to connect to environment: {e}", flush=True)
+        log_end(success=False, steps=0, score=0.0, rewards=[])
+        return
 
     rewards: List[float] = []
     steps_taken = 0
@@ -190,10 +202,15 @@ async def run_task(task: str) -> None:
 
             try:
                 if client is not None:
-                    pred = _llm_prediction(client, task, obs)
+                    try:
+                        pred = _llm_prediction(client, task, obs)
+                        last_action_error = None
+                    except Exception as llm_err:
+                        pred = _heuristic_prediction(task, obs)
+                        last_action_error = str(llm_err)
                 else:
                     pred = _heuristic_prediction(task, obs)
-                last_action_error = None
+                    last_action_error = None
             except Exception as exc:
                 pred = _heuristic_prediction(task, obs)
                 last_action_error = str(exc)
@@ -232,11 +249,14 @@ async def run_task(task: str) -> None:
         score = min(max(score, 0.0), 1.0)
         success = score >= SUCCESS_SCORE_THRESHOLD
 
+    except Exception as e:
+        print(f"[ERROR] Task {task} failed: {e}", flush=True)
     finally:
-        try:
-            await env.close()
-        except Exception:
-            pass
+        if env:
+            try:
+                await env.close()
+            except Exception:
+                pass
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
