@@ -1,14 +1,8 @@
 """
-Baseline Inference Script Example
-================================
-MANDATORY (per hackathon.md + sample_inference.py):
-- Reads: API_BASE_URL, MODEL_NAME, HF_TOKEN (or API_KEY fallback), IMAGE_NAME (optional)
-- Uses OpenAI client for all LLM calls
-- Emits structured stdout logs in [START] / [STEP] / [END] format
-
-This baseline runs the environment for each task: easy, medium, hard.
-It uses an LLM when credentials are provided; otherwise it falls back to a
-deterministic heuristic so you can still sanity-check locally.
+Baseline Inference Script
+========================
+MUST use judges' injected API_KEY and API_BASE_URL for LLM calls.
+Falls back to heuristic only if LLM call fails.
 """
 
 from __future__ import annotations
@@ -24,8 +18,8 @@ from openai import OpenAI
 from client import ChemicalDiscoveryEnv
 from models import ChemicalDiscoveryAction
 
-IMAGE_NAME = os.getenv("IMAGE_NAME")  # If you are using docker image
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+IMAGE_NAME = os.getenv("IMAGE_NAME")
+API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN")
 
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
@@ -202,15 +196,11 @@ async def run_task(task: str) -> None:
 
             try:
                 if client is not None:
-                    try:
-                        pred = _llm_prediction(client, task, obs)
-                        last_action_error = None
-                    except Exception as llm_err:
-                        pred = _heuristic_prediction(task, obs)
-                        last_action_error = str(llm_err)
+                    pred = _llm_prediction(client, task, obs)
+                    last_action_error = None
                 else:
                     pred = _heuristic_prediction(task, obs)
-                    last_action_error = None
+                    last_action_error = "null"
             except Exception as exc:
                 pred = _heuristic_prediction(task, obs)
                 last_action_error = str(exc)
