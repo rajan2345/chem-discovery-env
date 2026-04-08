@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Caching
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Docker (not committed, but Docker uses .dockerignore separately)
+.dockerignore
+
+# Local development
+.env
+.env.local
+*.log
+
+# Build artifacts
+*.whl
+
+# Not needed for deployment
+hackathon.md
+validator.sh
